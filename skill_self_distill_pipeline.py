@@ -14,17 +14,19 @@ os.environ['NO_PROXY'] = '76.64.185.52'
 os.environ['no_proxy'] = '76.64.185.52'
 
 
-PROMPT_TEMPLATE = """你是一个ipran网络运维专家，需要在网管侧完成一份排障手册，将输入转为skill。
+PROMPT_TEMPLATE = """你是一个ipran网络运维专家，需要在网管侧完成一份排障手册，将同一分类目录下的多篇输入文档合并转为一个完整的skill。
 
 # 任务要求
-- 根据**输入文档**的内容，生成一个完整的skill，同时要注意**用户要求**中的指示。
+- **输入文档集合**中每篇文档都以"## 文档：<标题>"作为分隔标记，均属于同一个二级目录分类下的故障处理案例，请将它们合并为**一个**完整的skill，同时要注意**用户要求**中的指示。
+- 如果多篇文档描述的是相同或高度相似的故障场景、排查步骤，请合并去重，避免重复内容。
+- 如果多篇文档描述的是不同的故障场景，请在同一个skill中按小节（如 `## 场景一：xxx`）分别组织排障思路，保持每个场景的排障步骤独立、完整。
 - 转换时，如果发现文档有缺漏，可以补充信息（比如需要进入某视图、需要commit）
 - 由于这份skill是给网管agent使用，因此某个步骤如果涉及收集信息、联系技术支持、提交给工程师等动作，请删除整个步骤，并删除其它步骤对此步骤的引用。
 - 如果某些引用了其它文档的链接（比如执行其它文档的诊断步骤），直接保留
 - 遇到源文档有大段回显时，不要照搬浪费token，在步骤中讲清要注意哪些回显内容即可。
 
-# 输入文档
-<input_doc>
+# 输入文档集合
+<input_docs>
 
 # 用户要求
 <user_demand>
@@ -117,32 +119,81 @@ def call_model_with_retry(api_url: str, model_name: str, question: str, max_retr
     return f"错误：{last_error}"
 
 
-def convert_document_to_skill(args: tuple) -> dict:
-    doc_path, output_dir, source_tree_dir, api_url, model_name, prompt_template = args
+def get_all_markdown_files(tree_dir: str) -> list:
+    md_files = []
+    for root, dirs, files in os.walk(tree_dir):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for file in files:
+            if file.endswith('.md'):
+                md_files.append(os.path.join(root, file))
+    return sorted(md_files)
 
-    rel_path = os.path.relpath(doc_path, source_tree_dir)
-    output_subdir = os.path.dirname(rel_path)
-    output_filename = os.path.basename(doc_path)
 
-    output_subdir_full = os.path.join(output_dir, output_subdir) if output_subdir else output_dir
+def group_files_by_second_level(md_files: list, source_tree_dir: str) -> dict:
+    """按源目录树的二级子目录对文档分组：<source_tree_dir>/一级目录/二级目录/*.md 归为同一组。
+
+    - 若文档位于二级目录及更深层级，按 (一级目录, 二级目录) 分组（更深层级一并并入该组）。
+    - 若文档仅位于一级目录下（没有二级目录），按 (一级目录,) 单独分组。
+    - 若文档直接位于 source_tree_dir 根目录下，归入 () 空分组。
+    分组结果按 key 排序，组内文件保持原有排序。
+    """
+    groups = {}
+    for doc_path in md_files:
+        rel_path = os.path.relpath(doc_path, source_tree_dir)
+        parts = Path(rel_path).parts
+        depth = len(parts) - 1
+        if depth >= 2:
+            key = (parts[0], parts[1])
+        elif depth == 1:
+            key = (parts[0],)
+        else:
+            key = ()
+        groups.setdefault(key, []).append(doc_path)
+    return dict(sorted(groups.items()))
+
+
+def build_merged_doc_content(file_paths: list) -> str:
+    doc_blocks = []
+    for doc_path in file_paths:
+        title = Path(doc_path).stem
+        with open(doc_path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read().strip()
+        doc_blocks.append(f"## 文档：{title}\n\n{content}")
+    return "\n\n---\n\n".join(doc_blocks)
+
+
+def convert_group_to_skill(args: tuple) -> dict:
+    group_key, file_paths, output_dir, api_url, model_name, prompt_template = args
+
+    if len(group_key) == 2:
+        level1, level2 = group_key
+        output_subdir_full = os.path.join(output_dir, level1)
+        output_filename = f"{level2}.md"
+    elif len(group_key) == 1:
+        (level1,) = group_key
+        output_subdir_full = output_dir
+        output_filename = f"{level1}.md"
+    else:
+        output_subdir_full = output_dir
+        output_filename = "root.md"
+
     os.makedirs(output_subdir_full, exist_ok=True)
+    output_path = os.path.join(output_subdir_full, output_filename)
 
-    print(f"[PID {os.getpid()}] 处理文档: {doc_path}")
+    group_label = "/".join(group_key) if group_key else "(root)"
+    print(f"[PID {os.getpid()}] 处理分组: {group_label} ({len(file_paths)} 个文档)")
 
     try:
-        with open(doc_path, 'r', encoding='utf-8', errors='replace') as f:
-            doc_content = f.read()
+        merged_doc_content = build_merged_doc_content(file_paths)
 
-        full_prompt = prompt_template.replace("<user_demand>", "").replace("<input_doc>", doc_content)
+        full_prompt = prompt_template.replace("<user_demand>", "").replace("<input_docs>", merged_doc_content)
 
         result = call_model_with_retry(api_url, model_name, full_prompt)
 
-        output_path = os.path.join(output_subdir_full, output_filename)
-
         result_dict = {
-            "source_path": doc_path,
+            "group": group_label,
+            "source_paths": file_paths,
             "output_path": output_path,
-            "rel_path": rel_path,
             "content": result,
             "success": not result.startswith("错误：")
         }
@@ -158,22 +209,12 @@ def convert_document_to_skill(args: tuple) -> dict:
     except Exception as e:
         print(f"[PID {os.getpid()}] 处理异常: {e}")
         return {
-            "source_path": doc_path,
+            "group": group_label,
+            "source_paths": file_paths,
             "output_path": None,
-            "rel_path": rel_path,
             "content": f"错误：{str(e)}",
             "success": False
         }
-
-
-def get_all_markdown_files(tree_dir: str) -> list:
-    md_files = []
-    for root, dirs, files in os.walk(tree_dir):
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
-        for file in files:
-            if file.endswith('.md'):
-                md_files.append(os.path.join(root, file))
-    return sorted(md_files)
 
 
 def build_file_tree(path: str, max_depth: int = 10) -> list:
@@ -235,23 +276,26 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS):
     md_files = get_all_markdown_files(SOURCE_TREE_DIR)
     print(f"\n找到 {len(md_files)} 个Markdown文档")
 
+    groups = group_files_by_second_level(md_files, SOURCE_TREE_DIR)
+    print(f"按二级目录合并为 {len(groups)} 个skill分组")
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     task_args = [
-        (doc_path, OUTPUT_DIR, SOURCE_TREE_DIR, API_URL, MODEL_NAME, PROMPT_TEMPLATE)
-        for doc_path in md_files
+        (group_key, file_paths, OUTPUT_DIR, API_URL, MODEL_NAME, PROMPT_TEMPLATE)
+        for group_key, file_paths in groups.items()
     ]
 
     results = []
     with Pool(processes=WORKERS) as pool:
-        results = pool.map(convert_document_to_skill, task_args)
+        results = pool.map(convert_group_to_skill, task_args)
 
     print("\n" + "=" * 60)
     print("转换完成!")
     print("=" * 60)
 
     success_count = sum(1 for r in results if r["success"])
-    print(f"\n成功: {success_count}/{len(results)}")
+    print(f"\n成功: {success_count}/{len(results)} 个分组，共 {len(md_files)} 篇源文档")
 
     tree = build_file_tree(OUTPUT_DIR)
     ascii_tree = tree_to_ascii(tree)
@@ -275,7 +319,8 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS):
             "output_dir": OUTPUT_DIR,
             "api_url": API_URL,
             "model_name": MODEL_NAME,
-            "total_files": len(results),
+            "total_source_files": len(md_files),
+            "total_groups": len(results),
             "success_count": success_count,
             "workers": WORKERS,
             "results": results
