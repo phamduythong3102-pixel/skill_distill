@@ -75,6 +75,16 @@ def extract_markdown_content(text: str) -> str:
     match = re.search(pattern, text, re.DOTALL)
     if match:
         return match.group(1).strip()
+
+    # 兜底：模型偶尔不带```markdown围栏，直接输出以frontmatter（---\nname:...）
+    # 开头的skill正文，或用不带语言标记的```围栏包裹。
+    fm_match = re.search(r"^-{3}\s*\n\s*name\s*:", text, re.MULTILINE)
+    if fm_match:
+        content = text[fm_match.start():].strip()
+        if content.endswith("```"):
+            content = content[:-3].strip()
+        return content
+
     return ""
 
 
@@ -109,7 +119,7 @@ def call_model_with_retry(api_url: str, model_name: str, question: str, max_retr
 
             extracted_content = extract_markdown_content(content)
             if not extracted_content:
-                raise Exception(f"No markdown content found. finish_reason={finish_reason}, 内容长度{len(content)}字符")
+                raise Exception(f"No markdown content found. finish_reason={finish_reason}, 内容长度{len(content)}字符, 开头内容: {content[:200]!r}")
             return extracted_content
 
         except requests.exceptions.Timeout:
