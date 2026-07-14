@@ -84,6 +84,7 @@ def call_model_with_retry(api_url: str, model_name: str, question: str, max_retr
         "messages": [{"role": "user", "content": question}],
         "stream": False,
         "temperature": 0.4,
+        "max_tokens": 16384,
         "chat_template_kwargs": {"enable_thinking": False, "thinking": False}
     }
 
@@ -93,17 +94,22 @@ def call_model_with_retry(api_url: str, model_name: str, question: str, max_retr
             response = requests.post(
                 api_url,
                 json=payload,
-                timeout=120,
+                timeout=300,
                 verify=False
             )
             response.raise_for_status()
             res_json = response.json()
-            message = res_json['choices'][0]['message']
+            choice = res_json['choices'][0]
+            message = choice['message']
             content = message.get('content') or ""
+
+            finish_reason = choice.get('finish_reason')
+            if finish_reason == 'length':
+                raise Exception(f"输出被截断(finish_reason=length)，内容长度{len(content)}字符，请增大max_tokens或拆分输入")
 
             extracted_content = extract_markdown_content(content)
             if not extracted_content:
-                raise Exception("No markdown content found.")
+                raise Exception(f"No markdown content found. finish_reason={finish_reason}, 内容长度{len(content)}字符")
             return extracted_content
 
         except requests.exceptions.Timeout:
@@ -300,6 +306,12 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS):
 
     success_count = sum(1 for r in results if r["success"])
     print(f"\n成功: {success_count}/{len(results)} 个分组，共 {len(md_files)} 篇源文档")
+
+    failed_results = [r for r in results if not r["success"]]
+    if failed_results:
+        print("\n失败分组明细:")
+        for r in failed_results:
+            print(f"  - {r['group']} ({len(r['source_paths'])} 个文档): {r['content']}")
 
     tree = build_file_tree(OUTPUT_DIR)
     ascii_tree = tree_to_ascii(tree)
