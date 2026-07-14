@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os
+import sys
+
+import re
+import json
+import requests
+from pathlib import Path
+from datetime import datetime
+from multiprocessing import Pool
+
+os.environ['NO_PROXY'] = '76.64.185.52'
+os.environ['no_proxy'] = '76.64.185.52'
+
+
+PROMPT_TEMPLATE = """你是一个ipran网络运维专家，需要在网管侧完成一份排障手册，将输入转为skill。
+
+# 任务要求
+- 根据**输入文档**的内容，生成一个完整的skill，同时要注意**用户要求**中的指示。
+- 转换时，如果发现文档有缺漏，可以补充信息（比如需要进入某视图、需要commit）
+- 由于这份skill是给网管agent使用，因此某个步骤如果涉及收集信息、联系技术支持、提交给工程师等动作，请删除整个步骤，并删除其它步骤对此步骤的引用。
+- 如果某些引用了其它文档的链接（比如执行其它文档的诊断步骤），直接保留
+- 遇到源文档有大段回显时，不要照搬浪费token，在步骤中讲清要注意哪些回显内容即可。
+
+# 输入文档
+<input_doc>
+
+# 用户要求
+<user_demand>
+
+# Skill输出内容格式
+
+```markdown
+---
+name: skill的英文名称（连字符使用-而不要使用_）
+description: skill的一句话简介
+---
+
+# xxx
+* 文档中完整的排障思路 + 对应排障所需工具
+* 按照标准markdown格式输出skill，以#开始，每层增加一个#
+......
+```
+
+# 输出格式参考
+```markdown
+---
+name: bgp
+description: 针对BGP邻居无法建立或频繁震荡场景的端到端排障指南。
+---
+
+# BGP邻居异常排障指南
+
+## 1. 确认BGP邻居状态与全局错误日志
+排障的第一步是明确当前BGP邻居停留在哪个状态（如Idle、Active、Connect等），并快速查看设备记录的BGP报错信息，这通常能直接指出问题所在。
+
+* **检查BGP邻居状态**：
+  使用 `display bgp peer` 查看邻居状态。如果状态不是 `Established`，则说明邻居关系异常。
+* **查看日志缓冲区**：
+  使用 `display logbuffer | include BGP` 检索近期是否有BGP状态变化的告警（Trap）信息，确认是刚初始化的建流失败还是已建连的邻居发生震荡（Flapping）。
+......
+```
+"""
+
+
+def extract_markdown_content(text: str) -> str:
+    pattern = r"```markdown\s*(.+)\s*```"
+    match = re.search(pattern, text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def call_model_with_retry(api_url: str, model_name: str, question: str, max_retries: int = 3, retry_delay: float = 1.0) -> str:
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": question}],
+        "stream": False,
+        "temperature": 0.4,
+        "chat_template_kwargs": {"enable_thinking": False, "thinking": False}
+    }
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                api_url,
+                json=payload,
+                timeout=120,
+                verify=False
+            )
+            response.raise_for_status()
+            res_json = response.json()
+            message = res_json['choices'][0]['message']
+            content = message.get('content') or ""
+
+            extracted_content = extract_markdown_content(content)
+            if not extracted_content:
+                raise Exception("No markdown content found.")
+            return extracted_content
+
+        except requests.exceptions.Timeout:
+            last_error = f"请求超时 (尝试 {attempt + 1}/{max_retries})"
+        except requests.exceptions.ConnectionError:
+            last_error = f"连接失败 (尝试 {attempt + 1}/{max_retries})"
+        except requests.exceptions.HTTPError as e:
+            last_error = f"HTTP错误: {e.response.status_code} (尝试 {attempt + 1}/{max_retries})"
+        except Exception as e:
+            last_error = f"未知错误: {str(e)} (尝试 {attempt + 1}/{max_retries})"
+
+        if attempt < max_retries - 1:
+            import time
+            time.sleep(retry_delay * (attempt + 1))
+            print(f"try failed: {last_error}")
+
+    return f"错误：{last_error}"
+
+
+def convert_document_to_skill(args: tuple) -> dict:
+    doc_path, output_dir, source_tree_dir, api_url, model_name, prompt_template = args
+
+    rel_path = os.path.relpath(doc_path, source_tree_dir)
+    output_subdir = os.path.dirname(rel_path)
+    output_filename = os.path.basename(doc_path)
+
+    output_subdir_full = os.path.join(output_dir, output_subdir) if output_subdir else output_dir
+    os.makedirs(output_subdir_full, exist_ok=True)
+
+    print(f"[PID {os.getpid()}] 处理文档: {doc_path}")
+
+    try:
+        with open(doc_path, 'r', encoding='utf-8', errors='replace') as f:
+            doc_content = f.read()
+
+        full_prompt = prompt_template.replace("<user_demand>", "").replace("<input_doc>", doc_content)
+
+        result = call_model_with_retry(api_url, model_name, full_prompt)
+
+        output_path = os.path.join(output_subdir_full, output_filename)
+
+        result_dict = {
+            "source_path": doc_path,
+            "output_path": output_path,
+            "rel_path": rel_path,
+            "content": result,
+            "success": not result.startswith("错误：")
+        }
+
+        if result_dict["success"]:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(result)
+            print(f"[PID {os.getpid()}] 已保存: {output_path}")
+        else:
+            print(f"[PID {os.getpid()}] 转换失败: {result}")
+
+        return result_dict
+    except Exception as e:
+        print(f"[PID {os.getpid()}] 处理异常: {e}")
+        return {
+            "source_path": doc_path,
+            "output_path": None,
+            "rel_path": rel_path,
+            "content": f"错误：{str(e)}",
+            "success": False
+        }
+
+
+def get_all_markdown_files(tree_dir: str) -> list:
+    md_files = []
+    for root, dirs, files in os.walk(tree_dir):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for file in files:
+            if file.endswith('.md'):
+                md_files.append(os.path.join(root, file))
+    return sorted(md_files)
+
+
+def build_file_tree(path: str, max_depth: int = 10) -> list:
+    tree = []
+    try:
+        if not os.path.exists(path):
+            return tree
+
+        items = os.listdir(path)
+        items = [
+            item
+            for item in items
+            if not item.startswith('.') and item not in ['node_modules', '__pycache__', '.git']
+        ]
+
+        base_path = Path(path)
+        items_with_type = [(item, (base_path / item).is_dir()) for item in items]
+        items_with_type.sort(key=lambda x: (not x[1], x[0].lower()))
+
+        for name, is_dir in items_with_type:
+            full_path = os.path.join(path, name)
+            node = {"name": name, "path": full_path, "is_dir": is_dir}
+            if is_dir and max_depth > 0:
+                node["children"] = build_file_tree(full_path, max_depth - 1)
+            elif is_dir:
+                node["children"] = []
+            tree.append(node)
+    except Exception as e:
+        print(f"读取目录 {path} 失败: {e}")
+    return tree
+
+
+def tree_to_ascii(tree: list, prefix: str = "", is_last: bool = True) -> str:
+    lines = []
+    for i, node in enumerate(tree):
+        is_last_node = (i == len(tree) - 1)
+        connector = "└── " if is_last_node else "├── "
+        extension = "│   " if not is_last_node else "    "
+
+        if node["is_dir"]:
+            lines.append(f"{prefix}{connector}{node['name']}/")
+            lines.append(tree_to_ascii(node.get("children", []), prefix + extension, is_last_node))
+        else:
+            lines.append(f"{prefix}{connector}{node['name']}")
+    return "\n".join(lines)
+
+
+def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS):
+    print("=" * 60)
+    print("Skill自蒸馏流水线")
+    print("=" * 60)
+    print(f"\n源文档树: {SOURCE_TREE_DIR}")
+    print(f"输出目录: {OUTPUT_DIR}")
+    print(f"API地址: {API_URL}")
+    print(f"模型: {MODEL_NAME}")
+    print(f"并行Worker数: {WORKERS}")
+    print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    md_files = get_all_markdown_files(SOURCE_TREE_DIR)
+    print(f"\n找到 {len(md_files)} 个Markdown文档")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    task_args = [
+        (doc_path, OUTPUT_DIR, SOURCE_TREE_DIR, API_URL, MODEL_NAME, PROMPT_TEMPLATE)
+        for doc_path in md_files
+    ]
+
+    results = []
+    with Pool(processes=WORKERS) as pool:
+        results = pool.map(convert_document_to_skill, task_args)
+
+    print("\n" + "=" * 60)
+    print("转换完成!")
+    print("=" * 60)
+
+    success_count = sum(1 for r in results if r["success"])
+    print(f"\n成功: {success_count}/{len(results)}")
+
+    tree = build_file_tree(OUTPUT_DIR)
+    ascii_tree = tree_to_ascii(tree)
+
+    tree_output_path = os.path.join(OUTPUT_DIR, "..", "skill_tree_structure.txt")
+    with open(tree_output_path, 'w', encoding='utf-8') as f:
+        f.write(f"Skill树结构图\n")
+        f.write(f"输出目录: {OUTPUT_DIR}\n")
+        f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(ascii_tree)
+
+    print(f"\n树结构图已保存到: {tree_output_path}")
+    print("\n" + ascii_tree)
+
+    json_report_path = os.path.join(OUTPUT_DIR, "..", "conversion_report.json")
+    with open(json_report_path, 'w', encoding='utf-8') as f:
+        json.dump({
+            "timestamp": datetime.now().isoformat(),
+            "source_dir": SOURCE_TREE_DIR,
+            "output_dir": OUTPUT_DIR,
+            "api_url": API_URL,
+            "model_name": MODEL_NAME,
+            "total_files": len(results),
+            "success_count": success_count,
+            "workers": WORKERS,
+            "results": results
+        }, f, ensure_ascii=False, indent=2)
+    print(f"\n转换报告已保存到: {json_report_path}")
+
+
+if __name__ == "__main__":
+    # main(
+    #     SOURCE_TREE_DIR="result/v01/tree",
+    #     OUTPUT_DIR="skills_distilled/v01",
+    #     API_URL="http://141.73.1.167:7412/v1/chat/completions",
+    #     MODEL_NAME="GLM-5.1-W4A8",
+    #     WORKERS=4
+    # )
+    main(
+        SOURCE_TREE_DIR="result/v01/tree",
+        OUTPUT_DIR="skills_distilled/v01",
+        API_URL="http://76.64.185.52:2207/v1/chat/completions",
+        MODEL_NAME="qwen3.6-27b",
+        WORKERS=3
+    )
