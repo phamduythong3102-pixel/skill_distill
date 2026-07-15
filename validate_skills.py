@@ -80,10 +80,14 @@ def check_skill_file(file_path: str, expected_name: str = None, known_paths: set
             issues.append(("ERROR", "frontmatter缺少description字段"))
 
     # 2.5 [路径]引用的可解析性：形如 [ip-routing/bgp-troubleshooting] 的引用
-    #     必须是已分配的skill路径（排除markdown链接 [text](url) 的方括号）
+    #     必须是已分配的skill路径。注意设备命令语法也用[]表示可选参数
+    #     （如 `display xxx [process-id]`），因此先剔除代码块和行内代码再扫描，
+    #     且未知引用仅在含"/"（skill路径特征）时报错，排除markdown链接 [text](url)。
     if known_paths:
-        for ref in re.findall(r"\[([a-z0-9][a-z0-9/-]*)\](?!\()", body):
-            if ref not in known_paths:
+        ref_scan_text = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
+        ref_scan_text = re.sub(r"`[^`\n]*`", "", ref_scan_text)
+        for ref in re.findall(r"\[([a-z0-9][a-z0-9/-]*)\](?!\()", ref_scan_text):
+            if ref not in known_paths and "/" in ref:
                 issues.append(("ERROR", f"引用了不存在的skill路径: [{ref}]"))
 
     # 3. 一级标题
