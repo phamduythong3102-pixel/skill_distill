@@ -14,7 +14,6 @@
   python3 validate_skills.py <目录>     # 校验指定目录
 存在ERROR时退出码为1。
 """
-import json
 import os
 import re
 import sys
@@ -39,11 +38,11 @@ FORBIDDEN_PHRASES = [
 TRUNCATION_TAIL_CHARS = ("，", "、", "：", ":", ",", "；", ";")
 
 
-def check_skill_file(file_path: str, expected_name: str = None, known_paths: set = None) -> list:
+def check_skill_file(file_path: str, known_paths: set = None) -> list:
     """返回 [(级别, 描述)] 列表，级别为 ERROR / WARN。
 
-    expected_name: 该skill的指定name（即所在目录名，有映射时校验一致性）。
-    known_paths: 全部已分配skill路径的集合（有映射时校验[路径]引用可解析）。
+    known_paths: 输出目录下全部skill相对路径（如"一级/二级.md"）的集合，
+                 用于校验正文中 [路径.md] 引用可解析。
     """
     issues = []
     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -69,25 +68,21 @@ def check_skill_file(file_path: str, expected_name: str = None, known_paths: set
         name_match = re.search(r"^name\s*:\s*(.+)$", fm, re.MULTILINE)
         if not name_match:
             issues.append(("ERROR", "frontmatter缺少name字段"))
-        else:
-            actual_name = name_match.group(1).strip()
-            if not NAME_PATTERN.match(actual_name):
-                issues.append(("WARN", f"name不符合命名规范（应为英文小写+连字符）: {actual_name!r}"))
-            if expected_name and actual_name != expected_name:
-                issues.append(("ERROR", f"name与skill_names.json指定不一致: 实际{actual_name!r}, 应为{expected_name!r}"))
+        elif not NAME_PATTERN.match(name_match.group(1).strip()):
+            issues.append(("WARN", f"name不符合命名规范（应为英文小写+连字符）: {name_match.group(1).strip()!r}"))
 
         if not re.search(r"^description\s*:\s*\S+", fm, re.MULTILINE):
             issues.append(("ERROR", "frontmatter缺少description字段"))
 
-    # 2.5 [路径]引用的可解析性：形如 [ip-routing/bgp-troubleshooting] 的引用
-    #     必须是已分配的skill路径。注意设备命令语法也用[]表示可选参数
-    #     （如 `display xxx [process-id]`），因此先剔除代码块和行内代码再扫描，
-    #     且未知引用仅在含"/"（skill路径特征）时报错，排除markdown链接 [text](url)。
+    # 2.5 [路径.md]引用的可解析性：形如 [故障处理：IP路由/BGP故障案例.md] 的引用
+    #     必须对应输出目录中真实存在的skill文件。注意设备命令语法也用[]表示
+    #     可选参数（如 `display xxx [process-id]`），因此先剔除代码块和行内代码
+    #     再扫描，且只匹配以.md结尾的引用；排除markdown链接 [text](url)。
     if known_paths:
         ref_scan_text = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
         ref_scan_text = re.sub(r"`[^`\n]*`", "", ref_scan_text)
-        for ref in re.findall(r"\[([a-z0-9][a-z0-9/-]*)\](?!\()", ref_scan_text):
-            if ref not in known_paths and "/" in ref:
+        for ref in re.findall(r"\[([^\[\]()\n]+?\.md)\](?!\()", ref_scan_text):
+            if ref.lstrip("./") not in known_paths:
                 issues.append(("ERROR", f"引用了不存在的skill路径: [{ref}]"))
 
     # 3. 一级标题
@@ -164,14 +159,10 @@ def main(skill_dir: str):
         print("错误: 目录下没有找到.md文件")
         sys.exit(1)
 
-    # 加载流水线生成的name映射，用于校验name一致性和[路径]引用可解析性
-    name_mapping = {}
-    names_path = os.path.join(skill_dir, "skill_names.json")
-    if os.path.exists(names_path):
-        with open(names_path, 'r', encoding='utf-8') as f:
-            name_mapping = json.load(f)
-        print(f"已加载name映射: {names_path} ({len(name_mapping.get('skills', {}))} 个skill)\n")
-    known_paths = set(name_mapping.get("paths", {}).values()) or None
+    # 已存在的skill相对路径集合（如"一级/二级.md"），[路径.md]引用必须能在其中解析
+    known_paths = {
+        os.path.relpath(f, skill_dir).replace(os.sep, "/") for f in md_files
+    }
 
     error_count = 0
     warn_count = 0
@@ -179,17 +170,7 @@ def main(skill_dir: str):
 
     for file_path in md_files:
         rel = os.path.relpath(file_path, skill_dir)
-        # skill文件为 <skill路径>/SKILL.md，指定name即其所在目录名
-        expected_name = None
-        if os.path.basename(file_path) == "SKILL.md" and known_paths:
-            skill_path = os.path.dirname(rel).replace(os.sep, "/")
-            if skill_path in known_paths:
-                expected_name = skill_path.rsplit("/", 1)[-1]
-            else:
-                print(f"● {rel}")
-                print(f"    [WARN] 该skill路径不在skill_names.json映射中: {skill_path}\n")
-                warn_count += 1
-        issues = check_skill_file(file_path, expected_name=expected_name, known_paths=known_paths)
+        issues = check_skill_file(file_path, known_paths=known_paths)
         if not issues:
             clean_count += 1
             continue
