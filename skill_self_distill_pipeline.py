@@ -29,15 +29,19 @@ PROMPT_TEMPLATE = """你是一个ipran网络运维专家，需要在网管侧完
 - 特别注意：输出全文**禁止出现**"联系技术支持"、"寻求技术支持"、"提交给工程师"、"收集信息并联系"等表述。原文档结尾常见的"若以上步骤仍未解决，请收集信息并联系技术支持"这类兜底句，必须整句删除，不要以任何改写形式保留；排障步骤穷尽后直接结束即可。
 - 引用其它文档时的处理规则（不要保留原始文档的路径或链接，它们在转换后已失效）：
   1. 如果被引用的文档就在本次**输入文档集合**中（已合并进本skill），改写为本skill内部小节的引用，如"参考场景A继续排查"。
-  2. 如果被引用的内容属于**skill目录清单**中的其它分类，改写为文字指引，如：参考skill《对应的skill名》。
+  2. 如果被引用的内容属于**skill目录清单**中的其它分类，改写为按name引用，格式：参考skill `对应的name`（name取自清单，用反引号包裹）。
   3. 如果被引用的文档不在清单中（如外部产品手册、命令参考），保留为纯文字说明（写明文档名称即可），不要输出链接。
 - 遇到源文档有大段回显时，不要照搬浪费token，在步骤中讲清要注意哪些回显内容即可。
 
 # 输入文档集合
 <input_docs>
 
+# 本skill的指定name
+<skill_name>
+frontmatter中的name字段必须使用上面的指定name，禁止自行命名。
+
 # skill目录清单
-本批次会将各分类目录分别生成为独立的skill，清单如下（格式：一级分类/skill名）。跨分类引用时请使用此清单中的skill名：
+本批次会将各分类目录分别生成为独立的skill，清单如下（格式：一级分类/二级分类 → name）。跨分类引用时必须使用清单中对应的name：
 <skill_catalog>
 
 # 用户要求
@@ -47,7 +51,7 @@ PROMPT_TEMPLATE = """你是一个ipran网络运维专家，需要在网管侧完
 
 ```markdown
 ---
-name: skill的英文名称（连字符使用-而不要使用_）
+name: 使用上面指定的name
 description: skill的一句话简介
 ---
 
@@ -150,6 +154,79 @@ def call_model_with_retry(api_url: str, model_name: str, question: str, max_retr
     return f"错误：{last_error}"
 
 
+NAMING_PROMPT_TEMPLATE = """你是一个ipran网络运维专家。以下是一批故障处理分类目录，每个分类将生成一个排障skill。
+请为每个分类起一个英文name，要求：
+- 全小写英文，单词间用连字符-连接（禁止下划线、空格、大写）
+- 能体现该分类的排障主题，简洁（2~5个单词）
+- 所有name必须互不重复
+
+以JSON对象输出，key为分类原名，value为name，包裹在```json代码块中，不要输出其它内容。
+
+分类清单：
+<labels>
+"""
+
+
+def sanitize_skill_name(name: str) -> str:
+    name = name.strip().lower().replace("_", "-").replace(" ", "-")
+    name = re.sub(r"[^a-z0-9-]", "", name)
+    name = re.sub(r"-{2,}", "-", name).strip("-")
+    return name
+
+
+def generate_skill_names(api_url: str, model_name: str, labels: list, max_retries: int = 3) -> dict:
+    """调用LLM为分组批量生成英文name，返回 {分组label: name}。失败抛异常。"""
+    prompt = NAMING_PROMPT_TEMPLATE.replace(
+        "<labels>", "\n".join(f"- {label}" for label in labels)
+    )
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "temperature": 0.2,
+        "max_tokens": 8192,
+        "chat_template_kwargs": {"enable_thinking": False, "thinking": False}
+    }
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(api_url, json=payload, timeout=300, verify=False)
+            response.raise_for_status()
+            content = response.json()['choices'][0]['message'].get('content') or ""
+
+            json_match = re.search(r"```json\s*(.+?)\s*```", content, re.DOTALL)
+            raw = json_match.group(1) if json_match else content
+            brace_match = re.search(r"\{.+\}", raw, re.DOTALL)
+            if not brace_match:
+                raise Exception(f"响应中未找到JSON对象, 开头内容: {content[:200]!r}")
+            mapping = json.loads(brace_match.group(0))
+
+            result = {}
+            used_names = set()
+            for label in labels:
+                name = sanitize_skill_name(str(mapping.get(label, "")))
+                if not name:
+                    raise Exception(f"分类 {label!r} 未获得有效name")
+                base_name = name
+                seq = 2
+                while name in used_names:
+                    name = f"{base_name}-{seq}"
+                    seq += 1
+                used_names.add(name)
+                result[label] = name
+            return result
+
+        except Exception as e:
+            last_error = str(e)
+            if attempt < max_retries - 1:
+                import time
+                time.sleep(attempt + 1)
+                print(f"命名调用失败: {last_error}")
+
+    raise Exception(f"skill命名失败: {last_error}")
+
+
 def get_all_markdown_files(tree_dir: str) -> list:
     md_files = []
     for root, dirs, files in os.walk(tree_dir):
@@ -194,7 +271,7 @@ def build_merged_doc_content(file_paths: list) -> str:
 
 
 def convert_group_to_skill(args: tuple) -> dict:
-    group_key, file_paths, output_dir, api_url, model_name, prompt_template, skill_catalog = args
+    group_key, file_paths, output_dir, api_url, model_name, prompt_template, skill_catalog, skill_name = args
 
     if len(group_key) == 2:
         level1, level2 = group_key
@@ -220,11 +297,19 @@ def convert_group_to_skill(args: tuple) -> dict:
         full_prompt = (
             prompt_template
             .replace("<user_demand>", "")
+            .replace("<skill_name>", skill_name)
             .replace("<skill_catalog>", skill_catalog)
             .replace("<input_docs>", merged_doc_content)
         )
 
         result = call_model_with_retry(api_url, model_name, full_prompt)
+
+        # 强制frontmatter使用指定name，避免模型自行命名导致引用对不上
+        if not result.startswith("错误："):
+            result = re.sub(
+                r"^(name\s*:\s*).+$", rf"\g<1>{skill_name}", result,
+                count=1, flags=re.MULTILINE
+            )
 
         result_dict = {
             "group": group_label,
@@ -315,10 +400,39 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None)
     groups = group_files_by_second_level(md_files, SOURCE_TREE_DIR)
     print(f"按二级目录合并为 {len(groups)} 个skill分组")
 
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # 阶段0：为全部分组预生成英文name（在任何skill生成之前），保证互相引用时
+    # name已经确定。映射持久化到skill_names.json，部分重跑时复用已有name。
+    all_labels = ["/".join(key) if key else "(root)" for key in groups]
+    names_path = os.path.join(OUTPUT_DIR, "skill_names.json")
+    name_mapping = {}
+    if os.path.exists(names_path):
+        with open(names_path, 'r', encoding='utf-8') as f:
+            name_mapping = json.load(f)
+        print(f"已加载现有name映射: {names_path} ({len(name_mapping)} 条)")
+
+    missing_labels = [label for label in all_labels if label not in name_mapping]
+    if missing_labels:
+        print(f"为 {len(missing_labels)} 个分组生成name...")
+        new_names = generate_skill_names(API_URL, MODEL_NAME, missing_labels)
+        # 与已有name去重
+        used_names = set(name_mapping.values())
+        for label, name in new_names.items():
+            base_name, seq = name, 2
+            while name in used_names:
+                name = f"{base_name}-{seq}"
+                seq += 1
+            used_names.add(name)
+            name_mapping[label] = name
+        with open(names_path, 'w', encoding='utf-8') as f:
+            json.dump(name_mapping, f, ensure_ascii=False, indent=2)
+        print(f"name映射已保存到: {names_path}")
+
     # 用全量分组构建skill目录清单（在GROUPS过滤之前），保证部分重跑时
     # 跨分类引用的skill名依然完整。
     skill_catalog = "\n".join(
-        f"- {'/'.join(key) if key else '(root)'}" for key in groups
+        f"- {label} → {name_mapping[label]}" for label in all_labels
     )
 
     if GROUPS:
@@ -336,10 +450,11 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None)
 
     total_docs = sum(len(paths) for paths in groups.values())
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
     task_args = [
-        (group_key, file_paths, OUTPUT_DIR, API_URL, MODEL_NAME, PROMPT_TEMPLATE, skill_catalog)
+        (
+            group_key, file_paths, OUTPUT_DIR, API_URL, MODEL_NAME, PROMPT_TEMPLATE,
+            skill_catalog, name_mapping["/".join(group_key) if group_key else "(root)"]
+        )
         for group_key, file_paths in groups.items()
     ]
 

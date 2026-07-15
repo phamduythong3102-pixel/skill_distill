@@ -14,6 +14,7 @@
   python3 validate_skills.py <目录>     # 校验指定目录
 存在ERROR时退出码为1。
 """
+import json
 import os
 import re
 import sys
@@ -38,8 +39,12 @@ FORBIDDEN_PHRASES = [
 TRUNCATION_TAIL_CHARS = ("，", "、", "：", ":", ",", "；", ";")
 
 
-def check_skill_file(file_path: str) -> list:
-    """返回 [(级别, 描述)] 列表，级别为 ERROR / WARN。"""
+def check_skill_file(file_path: str, expected_name: str = None, known_names: set = None) -> list:
+    """返回 [(级别, 描述)] 列表，级别为 ERROR / WARN。
+
+    expected_name: skill_names.json中为该文件指定的name（有映射时校验一致性）。
+    known_names: 全部已分配name的集合（有映射时校验引用可解析）。
+    """
     issues = []
     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
         content = f.read()
@@ -64,11 +69,21 @@ def check_skill_file(file_path: str) -> list:
         name_match = re.search(r"^name\s*:\s*(.+)$", fm, re.MULTILINE)
         if not name_match:
             issues.append(("ERROR", "frontmatter缺少name字段"))
-        elif not NAME_PATTERN.match(name_match.group(1).strip()):
-            issues.append(("WARN", f"name不符合命名规范（应为英文小写+连字符）: {name_match.group(1).strip()!r}"))
+        else:
+            actual_name = name_match.group(1).strip()
+            if not NAME_PATTERN.match(actual_name):
+                issues.append(("WARN", f"name不符合命名规范（应为英文小写+连字符）: {actual_name!r}"))
+            if expected_name and actual_name != expected_name:
+                issues.append(("ERROR", f"name与skill_names.json指定不一致: 实际{actual_name!r}, 应为{expected_name!r}"))
 
         if not re.search(r"^description\s*:\s*\S+", fm, re.MULTILINE):
             issues.append(("ERROR", "frontmatter缺少description字段"))
+
+    # 2.5 按name引用的可解析性：`参考skill `xxx`` 中的xxx必须是已分配的name
+    if known_names:
+        for ref in re.findall(r"skill\s*`([a-z0-9-]+)`", body):
+            if ref not in known_names:
+                issues.append(("ERROR", f"引用了不存在的skill name: {ref!r}"))
 
     # 3. 一级标题
     if not re.search(r"^# \S", body, re.MULTILINE):
@@ -144,13 +159,25 @@ def main(skill_dir: str):
         print("错误: 目录下没有找到.md文件")
         sys.exit(1)
 
+    # 加载流水线生成的name映射（分组label → name），用于校验name一致性和引用可解析性
+    name_mapping = {}
+    names_path = os.path.join(skill_dir, "skill_names.json")
+    if os.path.exists(names_path):
+        with open(names_path, 'r', encoding='utf-8') as f:
+            name_mapping = json.load(f)
+        print(f"已加载name映射: {names_path} ({len(name_mapping)} 条)\n")
+    known_names = set(name_mapping.values()) or None
+
     error_count = 0
     warn_count = 0
     clean_count = 0
 
     for file_path in md_files:
-        issues = check_skill_file(file_path)
         rel = os.path.relpath(file_path, skill_dir)
+        # 文件相对路径 一级/二级.md 对应映射里的label 一级/二级
+        label = rel.replace(os.sep, "/")[:-3]
+        expected_name = name_mapping.get(label)
+        issues = check_skill_file(file_path, expected_name=expected_name, known_names=known_names)
         if not issues:
             clean_count += 1
             continue
