@@ -98,16 +98,26 @@ def check_skill_file(file_path: str) -> list:
             line_no = content[:content.find(phrase)].count("\n") + 1
             issues.append(("WARN", f"第{line_no}行残留'{phrase}'，此类步骤应已删除"))
 
-    # 9. markdown链接检查：本地.md链接必须存在；.md路径链接一律提示
+    # 9. markdown链接检查：skill中不应残留任何本地文档链接（应改写为文字指引），
+    #    指向不存在文件的链接（含.html等原始文档遗留引用）为ERROR。
+    reported_targets = set()
     for target in MD_LINK_PATTERN.findall(body):
         if target.startswith(("http://", "https://", "#")):
             continue
         target_path = target.split("#")[0]
         if not target_path:
             continue
+        reported_targets.add(target_path)
         resolved = (Path(file_path).parent / target_path).resolve()
-        if target_path.endswith(".md") and not resolved.exists():
+        if not resolved.exists():
             issues.append(("ERROR", f"链接指向不存在的文件: {target}"))
+        else:
+            issues.append(("WARN", f"残留本地文档链接（应改写为文字指引）: {target}"))
+
+    # 10. 正文中残留的原始文档文件名（如 dc_vrp_xxx.html），即使不是链接形式
+    for match in re.finditer(r"[\w./-]+\.html?\b", body):
+        if match.group(0) not in reported_targets:
+            issues.append(("WARN", f"残留原始文档文件名: {match.group(0)}"))
 
     return issues
 
