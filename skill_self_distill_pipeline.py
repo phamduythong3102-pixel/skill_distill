@@ -364,7 +364,7 @@ if __name__ == "__main__":
     # )
     main(
         SOURCE_TREE_DIR="result/v01/tree",
-        OUTPUT_DIR=f"skills_distilled/{datetime.now().strftime('%m/%d')}",
+        OUTPUT_DIR=f"skills_distilled/{datetime.now().strftime('%m-%d')}",
         API_URL="http://76.64.185.52:2207/v1/chat/completions",
         MODEL_NAME="qwen3.6-27b",
         WORKERS=3
