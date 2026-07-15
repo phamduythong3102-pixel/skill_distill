@@ -282,7 +282,7 @@ def tree_to_ascii(tree: list, prefix: str = "", is_last: bool = True) -> str:
     return "\n".join(lines)
 
 
-def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS):
+def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None):
     print("=" * 60)
     print("Skill自蒸馏流水线")
     print("=" * 60)
@@ -298,6 +298,21 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS):
 
     groups = group_files_by_second_level(md_files, SOURCE_TREE_DIR)
     print(f"按二级目录合并为 {len(groups)} 个skill分组")
+
+    if GROUPS:
+        groups = {
+            key: paths
+            for key, paths in groups.items()
+            if any(pattern in ("/".join(key) if key else "(root)") for pattern in GROUPS)
+        }
+        print(f"按 --groups 参数过滤后剩余 {len(groups)} 个分组:")
+        for key in groups:
+            print(f"  - {'/'.join(key) if key else '(root)'}")
+        if not groups:
+            print("警告: 没有分组匹配指定的 --groups 参数，请检查名称（按'一级目录/二级目录'子串匹配）")
+            return
+
+    total_docs = sum(len(paths) for paths in groups.values())
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -315,7 +330,7 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS):
     print("=" * 60)
 
     success_count = sum(1 for r in results if r["success"])
-    print(f"\n成功: {success_count}/{len(results)} 个分组，共 {len(md_files)} 篇源文档")
+    print(f"\n成功: {success_count}/{len(results)} 个分组，共 {total_docs} 篇源文档")
 
     failed_results = [r for r in results if not r["success"]]
     if failed_results:
@@ -345,7 +360,8 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS):
             "output_dir": OUTPUT_DIR,
             "api_url": API_URL,
             "model_name": MODEL_NAME,
-            "total_source_files": len(md_files),
+            "groups_filter": GROUPS,
+            "total_source_files": total_docs,
             "total_groups": len(results),
             "success_count": success_count,
             "workers": WORKERS,
@@ -355,6 +371,15 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS):
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Skill自蒸馏流水线")
+    parser.add_argument(
+        "--groups", nargs="+", default=None,
+        help="只处理匹配的分组，按'一级目录/二级目录'子串匹配，可指定多个；"
+             "不传则处理全部分组。示例: --groups IP路由/BGP故障案例 IP组播/IP组播故障案例"
+    )
+    args = parser.parse_args()
+
     # main(
     #     SOURCE_TREE_DIR="result/v01/tree",
     #     OUTPUT_DIR="skills_distilled/v01",
@@ -367,5 +392,6 @@ if __name__ == "__main__":
         OUTPUT_DIR=f"skills_distilled/{datetime.now().strftime('%m-%d')}",
         API_URL="http://76.64.185.52:2207/v1/chat/completions",
         MODEL_NAME="qwen3.6-27b",
-        WORKERS=3
+        WORKERS=3,
+        GROUPS=args.groups
     )
