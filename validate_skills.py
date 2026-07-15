@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""校验蒸馏生成的skill文件是否完整合规。
+
+检查项：
+  [ERROR] 缺少frontmatter、缺少name/description、代码块围栏未闭合（疑似截断）、
+          残留```markdown包裹、markdown链接指向不存在的本地文件
+  [WARN]  name不符合命名规范（英文小写+连字符）、缺少一级标题、正文过短、
+          残留输入分隔标记（## 文档：）、疑似截断的结尾、
+          残留"联系技术支持/提交工程师"类步骤、残留原始文档路径引用
+
+用法：
+  python3 validate_skills.py            # 校验今天的输出目录 skills_distilled/mm-dd
+  python3 validate_skills.py <目录>     # 校验指定目录
+存在ERROR时退出码为1。
+"""
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+NAME_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+FRONTMATTER_PATTERN = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+MD_LINK_PATTERN = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
+
+FORBIDDEN_PHRASES = [
+    "联系技术支持",
+    "联系华为工程师",
+    "寻求技术支持",
+    "提交给工程师",
+    "报送工程师",
+    "收集以下信息并联系",
+]
+
+TRUNCATION_TAIL_CHARS = ("，", "、", "：", ":", ",", "；", ";", "-", "*", "|")
+
+
+def check_skill_file(file_path: str) -> list:
+    """返回 [(级别, 描述)] 列表，级别为 ERROR / WARN。"""
+    issues = []
+    with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+        content = f.read()
+
+    stripped = content.strip()
+    if not stripped:
+        return [("ERROR", "文件为空")]
+
+    # 1. 残留```markdown包裹（提取失败的痕迹）
+    if stripped.startswith("```"):
+        issues.append(("ERROR", "文件以```开头，残留了代码围栏包裹"))
+
+    # 2. frontmatter
+    fm_match = FRONTMATTER_PATTERN.match(content)
+    if not fm_match:
+        issues.append(("ERROR", "缺少frontmatter（--- name/description ---）"))
+        body = content
+    else:
+        fm = fm_match.group(1)
+        body = content[fm_match.end():]
+
+        name_match = re.search(r"^name\s*:\s*(.+)$", fm, re.MULTILINE)
+        if not name_match:
+            issues.append(("ERROR", "frontmatter缺少name字段"))
+        elif not NAME_PATTERN.match(name_match.group(1).strip()):
+            issues.append(("WARN", f"name不符合命名规范（应为英文小写+连字符）: {name_match.group(1).strip()!r}"))
+
+        if not re.search(r"^description\s*:\s*\S+", fm, re.MULTILINE):
+            issues.append(("ERROR", "frontmatter缺少description字段"))
+
+    # 3. 一级标题
+    if not re.search(r"^# \S", body, re.MULTILINE):
+        issues.append(("WARN", "正文缺少一级标题（# xxx）"))
+
+    # 4. 代码块围栏闭合（奇数个```为未闭合，典型的截断特征）
+    fence_count = len(re.findall(r"^\s*```", content, re.MULTILINE))
+    if fence_count % 2 != 0:
+        issues.append(("ERROR", f"代码块围栏未闭合（共{fence_count}个```），疑似输出被截断"))
+
+    # 5. 疑似截断的结尾
+    last_char = stripped[-1]
+    if last_char in TRUNCATION_TAIL_CHARS:
+        issues.append(("WARN", f"结尾字符为{last_char!r}，疑似输出在句中被截断"))
+
+    # 6. 正文过短
+    if len(stripped) < 300:
+        issues.append(("WARN", f"内容过短（{len(stripped)}字符），可能生成不完整"))
+
+    # 7. 残留输入分隔标记
+    if re.search(r"^#+\s*文档：", body, re.MULTILINE):
+        issues.append(("WARN", "残留输入分隔标记'## 文档：'，模型可能照搬了输入结构"))
+
+    # 8. 残留"联系技术支持"类步骤
+    for phrase in FORBIDDEN_PHRASES:
+        if phrase in body:
+            line_no = content[:content.find(phrase)].count("\n") + 1
+            issues.append(("WARN", f"第{line_no}行残留'{phrase}'，此类步骤应已删除"))
+
+    # 9. markdown链接检查：本地.md链接必须存在；.md路径链接一律提示
+    for target in MD_LINK_PATTERN.findall(body):
+        if target.startswith(("http://", "https://", "#")):
+            continue
+        target_path = target.split("#")[0]
+        if not target_path:
+            continue
+        resolved = (Path(file_path).parent / target_path).resolve()
+        if target_path.endswith(".md") and not resolved.exists():
+            issues.append(("ERROR", f"链接指向不存在的文件: {target}"))
+
+    return issues
+
+
+def main(skill_dir: str):
+    print("=" * 60)
+    print("Skill自验校验")
+    print("=" * 60)
+    print(f"校验目录: {skill_dir}\n")
+
+    if not os.path.isdir(skill_dir):
+        print(f"错误: 目录不存在: {skill_dir}")
+        sys.exit(1)
+
+    md_files = []
+    for root, dirs, files in os.walk(skill_dir):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for file in files:
+            if file.endswith('.md'):
+                md_files.append(os.path.join(root, file))
+    md_files.sort()
+
+    if not md_files:
+        print("错误: 目录下没有找到.md文件")
+        sys.exit(1)
+
+    error_count = 0
+    warn_count = 0
+    clean_count = 0
+
+    for file_path in md_files:
+        issues = check_skill_file(file_path)
+        rel = os.path.relpath(file_path, skill_dir)
+        if not issues:
+            clean_count += 1
+            continue
+        print(f"● {rel}")
+        for level, desc in issues:
+            print(f"    [{level}] {desc}")
+            if level == "ERROR":
+                error_count += 1
+            else:
+                warn_count += 1
+        print()
+
+    print("=" * 60)
+    print(f"共校验 {len(md_files)} 个skill: "
+          f"{clean_count} 个通过, {error_count} 个ERROR, {warn_count} 个WARN")
+    if error_count:
+        print("存在ERROR，建议重新生成对应分组（可用GROUPS参数只跑失败的分组）")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        skill_dir = sys.argv[1]
+    else:
+        skill_dir = f"skills_distilled/{datetime.now().strftime('%m-%d')}"
+    main(skill_dir)
