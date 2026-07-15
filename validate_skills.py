@@ -33,7 +33,9 @@ FORBIDDEN_PHRASES = [
     "收集以下信息并联系",
 ]
 
-TRUNCATION_TAIL_CHARS = ("，", "、", "：", ":", ",", "；", ";", "-", "*", "|")
+# 合法markdown可能以 * (粗体/列表)、- (分隔线)、| (表格行) 结尾，
+# 只把不可能正常收尾的标点视为截断特征。
+TRUNCATION_TAIL_CHARS = ("，", "、", "：", ":", ",", "；", ";")
 
 
 def check_skill_file(file_path: str) -> list:

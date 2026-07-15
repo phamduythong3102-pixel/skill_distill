@@ -26,6 +26,7 @@ PROMPT_TEMPLATE = """你是一个ipran网络运维专家，需要在网管侧完
   4. 若某场景与公共前置检查完全无交集，允许其步骤独立完整编写。
 - 转换时，如果发现文档有缺漏，可以补充信息（比如需要进入某视图、需要commit）
 - 由于这份skill是给网管agent使用，因此某个步骤如果涉及收集信息、联系技术支持、提交给工程师等动作，请删除整个步骤，并删除其它步骤对此步骤的引用。
+- 特别注意：输出全文**禁止出现**"联系技术支持"、"寻求技术支持"、"提交给工程师"、"收集信息并联系"等表述。原文档结尾常见的"若以上步骤仍未解决，请收集信息并联系技术支持"这类兜底句，必须整句删除，不要以任何改写形式保留；排障步骤穷尽后直接结束即可。
 - 引用其它文档时的处理规则（不要保留原始文档的路径或链接，它们在转换后已失效）：
   1. 如果被引用的文档就在本次**输入文档集合**中（已合并进本skill），改写为本skill内部小节的引用，如"参考场景A继续排查"。
   2. 如果被引用的内容属于**skill目录清单**中的其它分类，改写为文字指引，如：参考skill《对应的skill名》。
@@ -88,7 +89,10 @@ def extract_markdown_content(text: str) -> str:
     fm_match = re.search(r"^-{3}\s*\n\s*name\s*:", text, re.MULTILINE)
     if fm_match:
         content = text[fm_match.start():].strip()
-        if content.endswith("```"):
+        # 仅当frontmatter之前存在外层围栏的开头```时，结尾的```才是包裹围栏，
+        # 需要剥掉；否则结尾的```属于正文内代码块的闭合，剥掉会破坏内容。
+        has_wrapper_fence = "```" in text[:fm_match.start()]
+        if has_wrapper_fence and content.endswith("```"):
             content = content[:-3].strip()
         return content
 
