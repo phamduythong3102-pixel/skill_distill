@@ -39,11 +39,11 @@ FORBIDDEN_PHRASES = [
 TRUNCATION_TAIL_CHARS = ("，", "、", "：", ":", ",", "；", ";")
 
 
-def check_skill_file(file_path: str, expected_name: str = None, known_names: set = None) -> list:
+def check_skill_file(file_path: str, expected_name: str = None, known_paths: set = None) -> list:
     """返回 [(级别, 描述)] 列表，级别为 ERROR / WARN。
 
-    expected_name: skill_names.json中为该文件指定的name（有映射时校验一致性）。
-    known_names: 全部已分配name的集合（有映射时校验引用可解析）。
+    expected_name: 该skill的指定name（即所在目录名，有映射时校验一致性）。
+    known_paths: 全部已分配skill路径的集合（有映射时校验[路径]引用可解析）。
     """
     issues = []
     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -79,11 +79,12 @@ def check_skill_file(file_path: str, expected_name: str = None, known_names: set
         if not re.search(r"^description\s*:\s*\S+", fm, re.MULTILINE):
             issues.append(("ERROR", "frontmatter缺少description字段"))
 
-    # 2.5 按name引用的可解析性：`参考skill `xxx`` 中的xxx必须是已分配的name
-    if known_names:
-        for ref in re.findall(r"skill\s*`([a-z0-9-]+)`", body):
-            if ref not in known_names:
-                issues.append(("ERROR", f"引用了不存在的skill name: {ref!r}"))
+    # 2.5 [路径]引用的可解析性：形如 [ip-routing/bgp-troubleshooting] 的引用
+    #     必须是已分配的skill路径（排除markdown链接 [text](url) 的方括号）
+    if known_paths:
+        for ref in re.findall(r"\[([a-z0-9][a-z0-9/-]*)\](?!\()", body):
+            if ref not in known_paths:
+                issues.append(("ERROR", f"引用了不存在的skill路径: [{ref}]"))
 
     # 3. 一级标题
     if not re.search(r"^# \S", body, re.MULTILINE):
@@ -159,14 +160,14 @@ def main(skill_dir: str):
         print("错误: 目录下没有找到.md文件")
         sys.exit(1)
 
-    # 加载流水线生成的name映射（分组label → name），用于校验name一致性和引用可解析性
+    # 加载流水线生成的name映射，用于校验name一致性和[路径]引用可解析性
     name_mapping = {}
     names_path = os.path.join(skill_dir, "skill_names.json")
     if os.path.exists(names_path):
         with open(names_path, 'r', encoding='utf-8') as f:
             name_mapping = json.load(f)
-        print(f"已加载name映射: {names_path} ({len(name_mapping)} 条)\n")
-    known_names = set(name_mapping.values()) or None
+        print(f"已加载name映射: {names_path} ({len(name_mapping.get('skills', {}))} 个skill)\n")
+    known_paths = set(name_mapping.get("paths", {}).values()) or None
 
     error_count = 0
     warn_count = 0
@@ -174,10 +175,17 @@ def main(skill_dir: str):
 
     for file_path in md_files:
         rel = os.path.relpath(file_path, skill_dir)
-        # 文件相对路径 一级/二级.md 对应映射里的label 一级/二级
-        label = rel.replace(os.sep, "/")[:-3]
-        expected_name = name_mapping.get(label)
-        issues = check_skill_file(file_path, expected_name=expected_name, known_names=known_names)
+        # skill文件为 <skill路径>/SKILL.md，指定name即其所在目录名
+        expected_name = None
+        if os.path.basename(file_path) == "SKILL.md" and known_paths:
+            skill_path = os.path.dirname(rel).replace(os.sep, "/")
+            if skill_path in known_paths:
+                expected_name = skill_path.rsplit("/", 1)[-1]
+            else:
+                print(f"● {rel}")
+                print(f"    [WARN] 该skill路径不在skill_names.json映射中: {skill_path}\n")
+                warn_count += 1
+        issues = check_skill_file(file_path, expected_name=expected_name, known_paths=known_paths)
         if not issues:
             clean_count += 1
             continue

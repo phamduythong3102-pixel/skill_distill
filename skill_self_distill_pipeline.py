@@ -29,7 +29,7 @@ PROMPT_TEMPLATE = """你是一个ipran网络运维专家，需要在网管侧完
 - 特别注意：输出全文**禁止出现**"联系技术支持"、"寻求技术支持"、"提交给工程师"、"收集信息并联系"等表述。原文档结尾常见的"若以上步骤仍未解决，请收集信息并联系技术支持"这类兜底句，必须整句删除，不要以任何改写形式保留；排障步骤穷尽后直接结束即可。
 - 引用其它文档时的处理规则（不要保留原始文档的路径或链接，它们在转换后已失效）：
   1. 如果被引用的文档就在本次**输入文档集合**中（已合并进本skill），改写为本skill内部小节的引用，如"参考场景A继续排查"。
-  2. 如果被引用的内容属于**skill目录清单**中的其它分类，改写为按name引用，格式：参考skill `对应的name`（name取自清单，用反引号包裹）。
+  2. 如果被引用的内容属于**skill目录清单**中的其它分类，改写为skill引用标识，格式：参考[对应skill路径]（路径取自清单，用方括号包裹），如：参考[ip-routing/bgp-troubleshooting]。
   3. 如果被引用的文档不在清单中（如外部产品手册、命令参考），保留为纯文字说明（写明文档名称即可），不要输出链接。
 - 遇到源文档有大段回显时，不要照搬浪费token，在步骤中讲清要注意哪些回显内容即可。
 
@@ -41,7 +41,7 @@ PROMPT_TEMPLATE = """你是一个ipran网络运维专家，需要在网管侧完
 frontmatter中的name字段必须使用上面的指定name，禁止自行命名。
 
 # skill目录清单
-本批次会将各分类目录分别生成为独立的skill，清单如下（格式：一级分类/二级分类 → name）。跨分类引用时必须使用清单中对应的name：
+本批次会将各分类目录分别生成为独立的skill，清单如下（格式：中文分类 → [skill路径]）。跨分类引用时必须使用清单中对应的[skill路径]：
 <skill_catalog>
 
 # 用户要求
@@ -154,16 +154,24 @@ def call_model_with_retry(api_url: str, model_name: str, question: str, max_retr
     return f"错误：{last_error}"
 
 
-NAMING_PROMPT_TEMPLATE = """你是一个ipran网络运维专家。以下是一批故障处理分类目录，每个分类将生成一个排障skill。
-请为每个分类起一个英文name，要求：
+NAMING_PROMPT_TEMPLATE = """你是一个ipran网络运维专家。以下是故障处理文档的分类结构，将转换为排障skill库：
+- **一级分类**是大类目录（如"故障处理：IP路由"）
+- **skill分类**是具体的skill（如"故障处理：IP路由/IS-IS故障案例"）
+
+请为每个一级分类和每个skill分类起英文name，要求：
 - 全小写英文，单词间用连字符-连接（禁止下划线、空格、大写）
-- 能体现该分类的排障主题，简洁（2~5个单词）
-- 所有name必须互不重复
+- 能体现该分类的主题，简洁（1~5个单词），skill的name按其二级分类含义命名
+- 一级分类之间name互不重复；skill之间name互不重复
 
-以JSON对象输出，key为分类原名，value为name，包裹在```json代码块中，不要输出其它内容。
+以JSON对象输出，包含categories和skills两个字段，key为分类原名，value为name，
+包裹在```json代码块中，不要输出其它内容。输出格式示例：
+{"categories": {"故障处理：IP路由": "ip-routing"}, "skills": {"故障处理：IP路由/BGP故障案例": "bgp-troubleshooting"}}
 
-分类清单：
-<labels>
+一级分类清单：
+<category_labels>
+
+skill分类清单：
+<skill_labels>
 """
 
 
@@ -174,10 +182,31 @@ def sanitize_skill_name(name: str) -> str:
     return name
 
 
-def generate_skill_names(api_url: str, model_name: str, labels: list, max_retries: int = 3) -> dict:
-    """调用LLM为分组批量生成英文name，返回 {分组label: name}。失败抛异常。"""
-    prompt = NAMING_PROMPT_TEMPLATE.replace(
-        "<labels>", "\n".join(f"- {label}" for label in labels)
+def _pick_unique_names(raw_mapping: dict, labels: list, used_names: set, kind: str) -> dict:
+    result = {}
+    for label in labels:
+        name = sanitize_skill_name(str(raw_mapping.get(label, "")))
+        if not name:
+            raise Exception(f"{kind} {label!r} 未获得有效name")
+        base_name, seq = name, 2
+        while name in used_names:
+            name = f"{base_name}-{seq}"
+            seq += 1
+        used_names.add(name)
+        result[label] = name
+    return result
+
+
+def generate_skill_names(api_url: str, model_name: str, category_labels: list,
+                         skill_labels: list, max_retries: int = 3) -> tuple:
+    """调用LLM为一级分类和skill分组批量生成英文name。
+
+    返回 ({一级分类label: name}, {skill分组label: name})，失败抛异常。
+    """
+    prompt = (
+        NAMING_PROMPT_TEMPLATE
+        .replace("<category_labels>", "\n".join(f"- {label}" for label in category_labels) or "（无）")
+        .replace("<skill_labels>", "\n".join(f"- {label}" for label in skill_labels) or "（无）")
     )
     payload = {
         "model": model_name,
@@ -202,20 +231,9 @@ def generate_skill_names(api_url: str, model_name: str, labels: list, max_retrie
                 raise Exception(f"响应中未找到JSON对象, 开头内容: {content[:200]!r}")
             mapping = json.loads(brace_match.group(0))
 
-            result = {}
-            used_names = set()
-            for label in labels:
-                name = sanitize_skill_name(str(mapping.get(label, "")))
-                if not name:
-                    raise Exception(f"分类 {label!r} 未获得有效name")
-                base_name = name
-                seq = 2
-                while name in used_names:
-                    name = f"{base_name}-{seq}"
-                    seq += 1
-                used_names.add(name)
-                result[label] = name
-            return result
+            cat_names = _pick_unique_names(mapping.get("categories", {}), category_labels, set(), "一级分类")
+            skill_names = _pick_unique_names(mapping.get("skills", {}), skill_labels, set(), "skill分类")
+            return cat_names, skill_names
 
         except Exception as e:
             last_error = str(e)
@@ -271,22 +289,14 @@ def build_merged_doc_content(file_paths: list) -> str:
 
 
 def convert_group_to_skill(args: tuple) -> dict:
-    group_key, file_paths, output_dir, api_url, model_name, prompt_template, skill_catalog, skill_name = args
+    (group_key, file_paths, output_dir, api_url, model_name,
+     prompt_template, skill_catalog, skill_name, skill_rel_dir) = args
 
-    if len(group_key) == 2:
-        level1, level2 = group_key
-        output_subdir_full = os.path.join(output_dir, level1)
-        output_filename = f"{level2}.md"
-    elif len(group_key) == 1:
-        (level1,) = group_key
-        output_subdir_full = output_dir
-        output_filename = f"{level1}.md"
-    else:
-        output_subdir_full = output_dir
-        output_filename = "root.md"
-
+    # skill_rel_dir形如 "ip-routing/isis-troubleshooting"，skill正文固定命名SKILL.md，
+    # agent按 [skill_rel_dir] 引用并读取 skill_rel_dir/SKILL.md
+    output_subdir_full = os.path.join(output_dir, skill_rel_dir)
     os.makedirs(output_subdir_full, exist_ok=True)
-    output_path = os.path.join(output_subdir_full, output_filename)
+    output_path = os.path.join(output_subdir_full, "SKILL.md")
 
     group_label = "/".join(group_key) if group_key else "(root)"
     print(f"[PID {os.getpid()}] 处理分组: {group_label} ({len(file_paths)} 个文档)")
@@ -313,6 +323,7 @@ def convert_group_to_skill(args: tuple) -> dict:
 
         result_dict = {
             "group": group_label,
+            "skill_path": skill_rel_dir,
             "source_paths": file_paths,
             "output_path": output_path,
             "content": result,
@@ -331,56 +342,13 @@ def convert_group_to_skill(args: tuple) -> dict:
         print(f"[PID {os.getpid()}] 处理异常: {e}")
         return {
             "group": group_label,
+            "skill_path": skill_rel_dir,
             "source_paths": file_paths,
             "output_path": None,
             "content": f"错误：{str(e)}",
             "success": False
         }
 
-
-def build_file_tree(path: str, max_depth: int = 10) -> list:
-    tree = []
-    try:
-        if not os.path.exists(path):
-            return tree
-
-        items = os.listdir(path)
-        items = [
-            item
-            for item in items
-            if not item.startswith('.') and item not in ['node_modules', '__pycache__', '.git']
-        ]
-
-        base_path = Path(path)
-        items_with_type = [(item, (base_path / item).is_dir()) for item in items]
-        items_with_type.sort(key=lambda x: (not x[1], x[0].lower()))
-
-        for name, is_dir in items_with_type:
-            full_path = os.path.join(path, name)
-            node = {"name": name, "path": full_path, "is_dir": is_dir}
-            if is_dir and max_depth > 0:
-                node["children"] = build_file_tree(full_path, max_depth - 1)
-            elif is_dir:
-                node["children"] = []
-            tree.append(node)
-    except Exception as e:
-        print(f"读取目录 {path} 失败: {e}")
-    return tree
-
-
-def tree_to_ascii(tree: list, prefix: str = "", is_last: bool = True) -> str:
-    lines = []
-    for i, node in enumerate(tree):
-        is_last_node = (i == len(tree) - 1)
-        connector = "└── " if is_last_node else "├── "
-        extension = "│   " if not is_last_node else "    "
-
-        if node["is_dir"]:
-            lines.append(f"{prefix}{connector}{node['name']}/")
-            lines.append(tree_to_ascii(node.get("children", []), prefix + extension, is_last_node))
-        else:
-            lines.append(f"{prefix}{connector}{node['name']}")
-    return "\n".join(lines)
 
 
 def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None):
@@ -402,37 +370,55 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None)
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # 阶段0：为全部分组预生成英文name（在任何skill生成之前），保证互相引用时
-    # name已经确定。映射持久化到skill_names.json，部分重跑时复用已有name。
+    # 阶段0：为一级分类和全部分组预生成英文name（在任何skill生成之前），
+    # 保证互相引用时路径已经确定。映射持久化到skill_names.json，重跑时复用。
     all_labels = ["/".join(key) if key else "(root)" for key in groups]
+    category_labels = sorted({key[0] for key in groups if len(key) == 2})
     names_path = os.path.join(OUTPUT_DIR, "skill_names.json")
-    name_mapping = {}
+    name_mapping = {"categories": {}, "skills": {}, "paths": {}}
     if os.path.exists(names_path):
         with open(names_path, 'r', encoding='utf-8') as f:
             name_mapping = json.load(f)
-        print(f"已加载现有name映射: {names_path} ({len(name_mapping)} 条)")
+        print(f"已加载现有name映射: {names_path} ({len(name_mapping.get('skills', {}))} 个skill)")
 
-    missing_labels = [label for label in all_labels if label not in name_mapping]
-    if missing_labels:
-        print(f"为 {len(missing_labels)} 个分组生成name...")
-        new_names = generate_skill_names(API_URL, MODEL_NAME, missing_labels)
-        # 与已有name去重
-        used_names = set(name_mapping.values())
-        for label, name in new_names.items():
+    missing_cats = [c for c in category_labels if c not in name_mapping["categories"]]
+    missing_skills = [label for label in all_labels if label not in name_mapping["skills"]]
+    if missing_cats or missing_skills:
+        print(f"为 {len(missing_cats)} 个一级分类、{len(missing_skills)} 个skill分组生成name...")
+        new_cats, new_skills = generate_skill_names(API_URL, MODEL_NAME, missing_cats, missing_skills)
+        for label, name in new_cats.items():
+            used = set(name_mapping["categories"].values())
             base_name, seq = name, 2
-            while name in used_names:
+            while name in used:
                 name = f"{base_name}-{seq}"
                 seq += 1
-            used_names.add(name)
-            name_mapping[label] = name
-        with open(names_path, 'w', encoding='utf-8') as f:
-            json.dump(name_mapping, f, ensure_ascii=False, indent=2)
-        print(f"name映射已保存到: {names_path}")
+            name_mapping["categories"][label] = name
+        for label, name in new_skills.items():
+            used = set(name_mapping["skills"].values())
+            base_name, seq = name, 2
+            while name in used:
+                name = f"{base_name}-{seq}"
+                seq += 1
+            name_mapping["skills"][label] = name
+
+    # 计算每个分组的skill相对路径：<一级英文>/<skill英文name>，
+    # 无一级目录的分组直接放根目录下。
+    for key in groups:
+        label = "/".join(key) if key else "(root)"
+        skill_name = name_mapping["skills"][label]
+        if len(key) == 2:
+            name_mapping["paths"][label] = f"{name_mapping['categories'][key[0]]}/{skill_name}"
+        else:
+            name_mapping["paths"][label] = skill_name
+
+    with open(names_path, 'w', encoding='utf-8') as f:
+        json.dump(name_mapping, f, ensure_ascii=False, indent=2)
+    print(f"name映射已保存到: {names_path}")
 
     # 用全量分组构建skill目录清单（在GROUPS过滤之前），保证部分重跑时
-    # 跨分类引用的skill名依然完整。
+    # 跨分类引用的skill路径依然完整。
     skill_catalog = "\n".join(
-        f"- {label} → {name_mapping[label]}" for label in all_labels
+        f"- {label} → [{name_mapping['paths'][label]}]" for label in all_labels
     )
 
     if GROUPS:
@@ -450,13 +436,13 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None)
 
     total_docs = sum(len(paths) for paths in groups.values())
 
-    task_args = [
-        (
+    task_args = []
+    for group_key, file_paths in groups.items():
+        label = "/".join(group_key) if group_key else "(root)"
+        task_args.append((
             group_key, file_paths, OUTPUT_DIR, API_URL, MODEL_NAME, PROMPT_TEMPLATE,
-            skill_catalog, name_mapping["/".join(group_key) if group_key else "(root)"]
-        )
-        for group_key, file_paths in groups.items()
-    ]
+            skill_catalog, name_mapping["skills"][label], name_mapping["paths"][label]
+        ))
 
     results = []
     with Pool(processes=WORKERS) as pool:
@@ -475,19 +461,34 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None)
         for r in failed_results:
             print(f"  - {r['group']} ({len(r['source_paths'])} 个文档): {r['content']}")
 
-    tree = build_file_tree(OUTPUT_DIR)
-    ascii_tree = tree_to_ascii(tree)
+    # 生成带中文注释的skill树结构（供agent的prompt引用，格式：英文name (中文)）。
+    # 引用skill时用 [路径]，agent读取 路径/SKILL.md。
+    listing_lines = []
+    seen_cats = set()
+    for label in all_labels:
+        path = name_mapping["paths"][label]
+        if "/" in path:
+            cat_en, leaf_en = path.split("/", 1)
+            cat_cn, leaf_cn = label.split("/", 1)
+            if cat_en not in seen_cats:
+                listing_lines.append(f"- {cat_en} ({cat_cn})")
+                seen_cats.add(cat_en)
+            listing_lines.append(f"  - {leaf_en} ({leaf_cn})")
+        else:
+            listing_lines.append(f"- {path} ({label})")
+    skill_tree_text = "\n".join(listing_lines)
 
     tree_output_path = os.path.join(OUTPUT_DIR, "..", "skill_tree_structure.txt")
     with open(tree_output_path, 'w', encoding='utf-8') as f:
         f.write(f"Skill树结构图\n")
         f.write(f"输出目录: {OUTPUT_DIR}\n")
         f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("引用格式: [一级英文/skill英文name]，读取 <路径>/SKILL.md\n")
         f.write("=" * 60 + "\n\n")
-        f.write(ascii_tree)
+        f.write(skill_tree_text)
 
     print(f"\n树结构图已保存到: {tree_output_path}")
-    print("\n" + ascii_tree)
+    print("\n" + skill_tree_text)
 
     json_report_path = os.path.join(OUTPUT_DIR, "..", "conversion_report.json")
     with open(json_report_path, 'w', encoding='utf-8') as f:
