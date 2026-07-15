@@ -274,6 +274,20 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None)
     groups = group_files_by_second_level(md_files, SOURCE_TREE_DIR)
     print(f"按二级目录合并为 {len(groups)} 个skill分组")
 
+    # 源树规范层级是 一级/二级/*.md。落在一级目录下或根目录下的散文件
+    # 会单独成组、输出为 一级.md / root.md，多半是上游整理时放错了层级，
+    # 打印出具体源文件便于核对。
+    shallow_groups = {key: paths for key, paths in groups.items() if len(key) < 2}
+    if shallow_groups:
+        print(f"\n[WARN] 发现 {len(shallow_groups)} 个未到二级目录的散文件分组，"
+              f"请确认这些源文件的层级是否正确:")
+        for key, paths in shallow_groups.items():
+            print(f"  分组 {'/'.join(key) if key else '(root)'} "
+                  f"→ 输出 {group_key_to_rel_path(key)}")
+            for p in paths:
+                print(f"    - {os.path.relpath(p, SOURCE_TREE_DIR)}")
+        print()
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # 用全量分组构建skill目录清单（在GROUPS过滤之前），保证部分重跑时
