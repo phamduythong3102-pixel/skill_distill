@@ -26,11 +26,18 @@ PROMPT_TEMPLATE = """你是一个ipran网络运维专家，需要在网管侧完
   4. 若某场景与公共前置检查完全无交集，允许其步骤独立完整编写。
 - 转换时，如果发现文档有缺漏，可以补充信息（比如需要进入某视图、需要commit）
 - 由于这份skill是给网管agent使用，因此某个步骤如果涉及收集信息、联系技术支持、提交给工程师等动作，请删除整个步骤，并删除其它步骤对此步骤的引用。
-- 如果某些引用了其它文档的链接（比如执行其它文档的诊断步骤），直接保留
+- 引用其它文档时的处理规则（不要保留原始文档的路径或链接，它们在转换后已失效）：
+  1. 如果被引用的文档就在本次**输入文档集合**中（已合并进本skill），改写为本skill内部小节的引用，如"参考场景A继续排查"。
+  2. 如果被引用的内容属于**skill目录清单**中的其它分类，改写为文字指引，如：参考skill《对应的skill名》。
+  3. 如果被引用的文档不在清单中（如外部产品手册、命令参考），保留为纯文字说明（写明文档名称即可），不要输出链接。
 - 遇到源文档有大段回显时，不要照搬浪费token，在步骤中讲清要注意哪些回显内容即可。
 
 # 输入文档集合
 <input_docs>
+
+# skill目录清单
+本批次会将各分类目录分别生成为独立的skill，清单如下（格式：一级分类/skill名）。跨分类引用时请使用此清单中的skill名：
+<skill_catalog>
 
 # 用户要求
 <user_demand>
@@ -183,7 +190,7 @@ def build_merged_doc_content(file_paths: list) -> str:
 
 
 def convert_group_to_skill(args: tuple) -> dict:
-    group_key, file_paths, output_dir, api_url, model_name, prompt_template = args
+    group_key, file_paths, output_dir, api_url, model_name, prompt_template, skill_catalog = args
 
     if len(group_key) == 2:
         level1, level2 = group_key
@@ -206,7 +213,12 @@ def convert_group_to_skill(args: tuple) -> dict:
     try:
         merged_doc_content = build_merged_doc_content(file_paths)
 
-        full_prompt = prompt_template.replace("<user_demand>", "").replace("<input_docs>", merged_doc_content)
+        full_prompt = (
+            prompt_template
+            .replace("<user_demand>", "")
+            .replace("<skill_catalog>", skill_catalog)
+            .replace("<input_docs>", merged_doc_content)
+        )
 
         result = call_model_with_retry(api_url, model_name, full_prompt)
 
@@ -299,6 +311,12 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None)
     groups = group_files_by_second_level(md_files, SOURCE_TREE_DIR)
     print(f"按二级目录合并为 {len(groups)} 个skill分组")
 
+    # 用全量分组构建skill目录清单（在GROUPS过滤之前），保证部分重跑时
+    # 跨分类引用的skill名依然完整。
+    skill_catalog = "\n".join(
+        f"- {'/'.join(key) if key else '(root)'}" for key in groups
+    )
+
     if GROUPS:
         groups = {
             key: paths
@@ -317,7 +335,7 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     task_args = [
-        (group_key, file_paths, OUTPUT_DIR, API_URL, MODEL_NAME, PROMPT_TEMPLATE)
+        (group_key, file_paths, OUTPUT_DIR, API_URL, MODEL_NAME, PROMPT_TEMPLATE, skill_catalog)
         for group_key, file_paths in groups.items()
     ]
 
