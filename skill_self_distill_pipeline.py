@@ -371,15 +371,6 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None)
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Skill自蒸馏流水线")
-    parser.add_argument(
-        "--groups", nargs="+", default=None,
-        help="只处理匹配的分组，按'一级目录/二级目录'子串匹配，可指定多个；"
-             "不传则处理全部分组。示例: --groups IP路由/BGP故障案例 IP组播/IP组播故障案例"
-    )
-    args = parser.parse_args()
-
     # main(
     #     SOURCE_TREE_DIR="result/v01/tree",
     #     OUTPUT_DIR="skills_distilled/v01",
@@ -393,5 +384,8 @@ if __name__ == "__main__":
         API_URL="http://76.64.185.52:2207/v1/chat/completions",
         MODEL_NAME="qwen3.6-27b",
         WORKERS=3,
-        GROUPS=args.groups
+        # GROUPS=None 表示处理全部分组；只想跑部分分组时，
+        # 传入按'一级目录/二级目录'子串匹配的名称列表，例如：
+        # GROUPS=["IP组播/IP组播故障案例", "IP路由/BGP故障案例", "IP路由/IS-IS故障案例"]
+        GROUPS=None
     )
