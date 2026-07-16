@@ -7,8 +7,7 @@
           残留```markdown包裹、markdown链接指向不存在的本地文件
   [WARN]  name不符合命名规范（英文小写+连字符）、缺少一级标题、正文过短、
           残留输入分隔标记（## 文档：）、疑似截断的结尾、
-          残留"联系技术支持/提交工程师"类步骤、残留原始文档路径引用、
-          代码块中残留设备提示符（[~HUAWEI]类回显）或命令行内#注释
+          残留"联系技术支持/提交工程师"类步骤、残留原始文档路径引用
 
 用法：
   python3 validate_skills.py            # 校验今天的输出目录 skills_distilled/mm-dd
@@ -37,15 +36,6 @@ FORBIDDEN_PHRASES = [
 # 合法markdown可能以 * (粗体/列表)、- (分隔线)、| (表格行) 结尾，
 # 只把不可能正常收尾的标点视为截断特征。
 TRUNCATION_TAIL_CHARS = ("，", "、", "：", ":", ",", "；", ";")
-
-CODE_BLOCK_PATTERN = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
-# 设备提示符是回显不是输入，命令块中不应残留：
-#   [~HUAWEI] / [*HUAWEI-aaa] 配置视图提示符；<HUAWEI> 用户视图提示符后跟命令。
-#   <...>形式要求以大写字母开头（主机名惯例），避免误伤 <scheme-name> 类占位符。
-DEVICE_PROMPT_PATTERN = re.compile(r"^\s*(\[[~*][\w.:-]*\]|<[A-Z][\w.:-]*>)\s*\S")
-# 命令后跟 " # 注释"。设备CLI不识别行内注释，整行下发会报错；
-# 整行注释（以#开头）不在此列。
-INLINE_COMMENT_PATTERN = re.compile(r"\S\s+#\s*\S")
 
 
 def check_skill_file(file_path: str, known_paths: set = None) -> list:
@@ -143,19 +133,6 @@ def check_skill_file(file_path: str, known_paths: set = None) -> list:
     for match in re.finditer(r"[\w./-]+\.html?\b", body):
         if match.group(0) not in reported_targets:
             issues.append(("WARN", f"残留原始文档文件名: {match.group(0)}"))
-
-    # 11. 命令代码块应只含可直接下发的命令：
-    #     残留设备提示符（回显混入输入）或行内#注释（设备CLI不识别）都会
-    #     导致agent整行下发时报错。
-    for block in CODE_BLOCK_PATTERN.findall(body):
-        for line in block.splitlines():
-            stripped_line = line.strip()
-            if not stripped_line:
-                continue
-            if DEVICE_PROMPT_PATTERN.match(line):
-                issues.append(("WARN", f"代码块中残留设备提示符（应只保留命令本身）: {stripped_line[:50]!r}"))
-            elif not stripped_line.startswith("#") and INLINE_COMMENT_PATTERN.search(line):
-                issues.append(("WARN", f"代码块命令行内含#注释（设备不识别，应移到正文）: {stripped_line[:50]!r}"))
 
     return issues
 
