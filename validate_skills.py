@@ -4,16 +4,20 @@
 
 检查项：
   [ERROR] 缺少frontmatter、缺少name/description、代码块围栏未闭合（疑似截断）、
-          残留```markdown包裹、markdown链接指向不存在的本地文件
+          残留```markdown包裹、markdown链接指向不存在的本地文件、
+          conversion_report.json中记录的转换失败分组
   [WARN]  name不符合命名规范（英文小写+连字符）、缺少一级标题、正文过短、
           残留输入分隔标记（## 文档：）、疑似截断的结尾、
           残留"联系技术支持/提交工程师"类步骤、残留原始文档路径引用
 
+存在ERROR时退出码为1，并输出可直接复制重跑的 GROUPS=[...] 参数
+（含转换失败的分组与校验出ERROR的skill对应的分组）。
+
 用法：
   python3 validate_skills.py            # 校验今天的输出目录 skills_distilled/mm-dd
   python3 validate_skills.py <目录>     # 校验指定目录
-存在ERROR时退出码为1。
 """
+import json
 import os
 import re
 import sys
@@ -137,6 +141,29 @@ def check_skill_file(file_path: str, known_paths: set = None) -> list:
     return issues
 
 
+def load_failed_conversions(skill_dir: str) -> list:
+    """读取目录下的conversion_report.json，返回转换失败的result条目列表。
+    报告不存在或无法解析时返回空列表（不影响文件校验本身）。"""
+    report_path = os.path.join(skill_dir, "conversion_report.json")
+    if not os.path.isfile(report_path):
+        return []
+    try:
+        with open(report_path, 'r', encoding='utf-8') as f:
+            report = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[WARN] 无法解析转换报告 {report_path}: {e}\n")
+        return []
+    return [r for r in report.get("results", []) if not r.get("success")]
+
+
+def rel_path_to_group(rel_path: str) -> str:
+    """skill相对路径 → GROUPS参数用的分组名，如 一级/二级.md → 一级/二级。"""
+    rel = rel_path.replace(os.sep, "/")
+    if rel == "root.md":
+        return "(root)"
+    return rel[:-3] if rel.endswith(".md") else rel
+
+
 def main(skill_dir: str):
     print("=" * 60)
     print("Skill自验校验")
@@ -167,6 +194,7 @@ def main(skill_dir: str):
     error_count = 0
     warn_count = 0
     clean_count = 0
+    rerun_groups = set()  # 需要重跑的分组：校验出ERROR的skill + 报告中转换失败的分组
 
     for file_path in md_files:
         rel = os.path.relpath(file_path, skill_dir)
@@ -175,19 +203,35 @@ def main(skill_dir: str):
             clean_count += 1
             continue
         print(f"● {rel}")
+        has_error = False
         for level, desc in issues:
             print(f"    [{level}] {desc}")
             if level == "ERROR":
                 error_count += 1
+                has_error = True
             else:
                 warn_count += 1
+        if has_error:
+            rerun_groups.add(rel_path_to_group(rel))
+        print()
+
+    # 转换阶段就失败的分组没有输出文件，只能从conversion_report.json中发现
+    failed_conversions = load_failed_conversions(skill_dir)
+    if failed_conversions:
+        print("● conversion_report.json 中记录的转换失败分组:")
+        for r in failed_conversions:
+            group = r.get("group") or rel_path_to_group(r.get("skill_path", ""))
+            print(f"    [ERROR] {group}: {r.get('content', '')}")
+            error_count += 1
+            rerun_groups.add(group)
         print()
 
     print("=" * 60)
     print(f"共校验 {len(md_files)} 个skill: "
           f"{clean_count} 个通过, {error_count} 个ERROR, {warn_count} 个WARN")
     if error_count:
-        print("存在ERROR，建议重新生成对应分组（可用GROUPS参数只跑失败的分组）")
+        print("存在ERROR，建议重新生成对应分组（可用GROUPS参数只跑失败的分组）:")
+        print(f"GROUPS={json.dumps(sorted(rerun_groups), ensure_ascii=False)}")
         sys.exit(1)
 
 
