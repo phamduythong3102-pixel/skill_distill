@@ -409,7 +409,7 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None)
             listing_lines.append("  - root.md")
     skill_tree_text = "\n".join(listing_lines)
 
-    tree_output_path = os.path.join(OUTPUT_DIR, "..", "skill_tree_structure.txt")
+    tree_output_path = os.path.join(OUTPUT_DIR, "skill_tree_structure.txt")
     with open(tree_output_path, 'w', encoding='utf-8') as f:
         f.write(f"Skill树结构图\n")
         f.write(f"输出目录: {OUTPUT_DIR}\n")
@@ -421,7 +421,7 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None)
     print(f"\n树结构图已保存到: {tree_output_path}")
     print("\n" + skill_tree_text)
 
-    json_report_path = os.path.join(OUTPUT_DIR, "..", "conversion_report.json")
+    json_report_path = os.path.join(OUTPUT_DIR, "conversion_report.json")
     with open(json_report_path, 'w', encoding='utf-8') as f:
         json.dump({
             "timestamp": datetime.now().isoformat(),
