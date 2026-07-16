@@ -421,7 +421,27 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None)
     print(f"\n树结构图已保存到: {tree_output_path}")
     print("\n" + skill_tree_text)
 
+    # 报告增量合并：部分重跑(GROUPS)时，本次跑过的分组按skill_path覆盖已有
+    # 报告中的对应条目，未跑的分组保留上次记录；同时清理源树中已不存在的
+    # 过期条目（如分组规则变化后遗留的旧路径），报告始终反映目录的最新全貌。
     json_report_path = os.path.join(OUTPUT_DIR, "conversion_report.json")
+    expected_paths = {group_key_to_rel_path(key) for key in all_keys}
+    merged_results = {}
+    if os.path.isfile(json_report_path):
+        try:
+            with open(json_report_path, 'r', encoding='utf-8') as f:
+                old_report = json.load(f)
+            merged_results = {
+                r["skill_path"]: r
+                for r in old_report.get("results", [])
+                if r.get("skill_path") in expected_paths
+            }
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[WARN] 已有转换报告无法解析，将重新生成: {e}")
+    for r in results:
+        merged_results[r["skill_path"]] = r
+    all_results = [merged_results[path] for path in sorted(merged_results)]
+
     with open(json_report_path, 'w', encoding='utf-8') as f:
         json.dump({
             "timestamp": datetime.now().isoformat(),
@@ -430,13 +450,14 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None)
             "api_url": API_URL,
             "model_name": MODEL_NAME,
             "groups_filter": GROUPS,
-            "total_source_files": total_docs,
-            "total_groups": len(results),
-            "success_count": success_count,
+            "total_source_files": sum(len(r["source_paths"]) for r in all_results),
+            "total_groups": len(all_results),
+            "success_count": sum(1 for r in all_results if r["success"]),
             "workers": WORKERS,
-            "results": results
+            "results": all_results
         }, f, ensure_ascii=False, indent=2)
-    print(f"\n转换报告已保存到: {json_report_path}")
+    print(f"\n转换报告已保存到: {json_report_path}"
+          f"（本次 {len(results)} 个分组，合并后共 {len(all_results)} 个分组）")
 
 
 if __name__ == "__main__":
