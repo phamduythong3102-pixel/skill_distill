@@ -161,26 +161,89 @@ def get_all_markdown_files(tree_dir: str) -> list:
     return sorted(md_files)
 
 
+# 计算文档名与二级目录名的相似度前先剔除的通用词，避免"故障""案例"这类
+# 字样在所有名称之间制造虚假重叠。
+GENERIC_NAME_TOKENS = ("故障案例", "常见故障", "故障", "案例", "：", ":")
+
+
+def _strip_generic_tokens(name: str) -> str:
+    for token in GENERIC_NAME_TOKENS:
+        name = name.replace(token, "")
+    return name.strip()
+
+
+def _longest_common_substring_len(a: str, b: str) -> int:
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    best = 0
+    for ch_a in a:
+        cur = [0] * (len(b) + 1)
+        for j, ch_b in enumerate(b, 1):
+            if ch_a == ch_b:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best:
+                    best = cur[j]
+        prev = cur
+    return best
+
+
+def derive_case_group_name(level1_dir: str) -> str:
+    """一级目录没有二级目录时，散文档合并组的名称：
+    去掉"故障处理："类前缀后加"故障案例"，如 故障处理：QoS → QoS故障案例。"""
+    base = re.split(r"[：:]", level1_dir)[-1].strip() or level1_dir
+    return f"{base}故障案例"
+
+
 def group_files_by_second_level(md_files: list, source_tree_dir: str) -> dict:
     """按源目录树的二级子目录对文档分组：<source_tree_dir>/一级目录/二级目录/*.md 归为同一组。
 
     - 若文档位于二级目录及更深层级，按 (一级目录, 二级目录) 分组（更深层级一并并入该组）。
-    - 若文档仅位于一级目录下（没有二级目录），按 (一级目录,) 单独分组。
+    - 若文档散落在一级目录下（没套二级目录）：
+      * 该一级目录下存在二级分组时，并入名称最相似（剔除通用词后最长公共子串>=2）
+        的既有二级分组；
+      * 无法匹配或该一级目录没有任何二级目录时，全部合并为
+        (一级目录, derive_case_group_name(一级目录)) 一个新分组。
+      每篇散文档的归并决策都会打印出来，便于核对归属。
     - 若文档直接位于 source_tree_dir 根目录下，归入 () 空分组。
     分组结果按 key 排序，组内文件保持原有排序。
     """
     groups = {}
+    loose_by_level1 = {}
     for doc_path in md_files:
         rel_path = os.path.relpath(doc_path, source_tree_dir)
         parts = Path(rel_path).parts
         depth = len(parts) - 1
         if depth >= 2:
-            key = (parts[0], parts[1])
+            groups.setdefault((parts[0], parts[1]), []).append(doc_path)
         elif depth == 1:
-            key = (parts[0],)
+            loose_by_level1.setdefault(parts[0], []).append(doc_path)
         else:
-            key = ()
-        groups.setdefault(key, []).append(doc_path)
+            groups.setdefault((), []).append(doc_path)
+
+    merge_notes = []
+    for level1, doc_paths in loose_by_level1.items():
+        existing_level2 = [key[1] for key in groups if len(key) == 2 and key[0] == level1]
+        for doc_path in doc_paths:
+            doc_token = _strip_generic_tokens(Path(doc_path).stem)
+            best_name, best_score = None, 0
+            for level2 in existing_level2:
+                score = _longest_common_substring_len(doc_token, _strip_generic_tokens(level2))
+                if score > best_score:
+                    best_name, best_score = level2, score
+            if best_name is not None and best_score >= 2:
+                target, reason = best_name, f"按名称并入既有分组"
+            else:
+                target, reason = derive_case_group_name(level1), "无匹配的二级目录，归入新分组"
+            groups.setdefault((level1, target), []).append(doc_path)
+            merge_notes.append(
+                f"{os.path.relpath(doc_path, source_tree_dir)} → {level1}/{target}.md ({reason})")
+
+    if merge_notes:
+        print(f"\n[INFO] {len(merge_notes)} 篇一级目录下的散文档已并入二级分组，请核对归属:")
+        for note in merge_notes:
+            print(f"  - {note}")
+
     return dict(sorted(groups.items()))
 
 
@@ -274,18 +337,14 @@ def main(SOURCE_TREE_DIR, OUTPUT_DIR, API_URL, MODEL_NAME, WORKERS, GROUPS=None)
     groups = group_files_by_second_level(md_files, SOURCE_TREE_DIR)
     print(f"按二级目录合并为 {len(groups)} 个skill分组")
 
-    # 源树规范层级是 一级/二级/*.md。落在一级目录下或根目录下的散文件
-    # 会单独成组、输出为 一级.md / root.md，多半是上游整理时放错了层级，
-    # 打印出具体源文件便于核对。
-    shallow_groups = {key: paths for key, paths in groups.items() if len(key) < 2}
-    if shallow_groups:
-        print(f"\n[WARN] 发现 {len(shallow_groups)} 个未到二级目录的散文件分组，"
-              f"请确认这些源文件的层级是否正确:")
-        for key, paths in shallow_groups.items():
-            print(f"  分组 {'/'.join(key) if key else '(root)'} "
-                  f"→ 输出 {group_key_to_rel_path(key)}")
-            for p in paths:
-                print(f"    - {os.path.relpath(p, SOURCE_TREE_DIR)}")
+    # 一级目录下的散文档已在分组时自动并入二级分组（见group_files_by_second_level
+    # 打印的归并明细）；直接位于源目录根下的文档无法归入任何一级分类，仍需人工整理。
+    root_docs = groups.get(())
+    if root_docs:
+        print(f"\n[WARN] 发现 {len(root_docs)} 篇直接位于源目录根下的文档，"
+              f"无法归入任何一级分类，将合并输出为 root.md:")
+        for p in root_docs:
+            print(f"  - {os.path.relpath(p, SOURCE_TREE_DIR)}")
         print()
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
